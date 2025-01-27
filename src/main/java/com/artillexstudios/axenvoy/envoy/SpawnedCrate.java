@@ -13,11 +13,8 @@ import com.artillexstudios.axenvoy.rewards.Reward;
 import com.artillexstudios.axenvoy.user.User;
 import com.artillexstudios.axenvoy.utils.FallingBlockChecker;
 import com.artillexstudios.axenvoy.utils.Utils;
-import org.bukkit.Bukkit;
-import org.bukkit.FireworkEffect;
-import org.bukkit.Location;
-import org.bukkit.Material;
-import org.bukkit.NamespacedKey;
+import org.bukkit.*;
+import org.bukkit.block.Block;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.FallingBlock;
@@ -45,7 +42,6 @@ public class SpawnedCrate {
     private Hologram hologram;
     private int tick = 0;
     private int health;
-
     public SpawnedCrate(@NotNull Envoy parent, @NotNull CrateType handle, @NotNull Location location) {
         this.health = handle.getConfig().REQUIRED_INTERACTION_AMOUNT;
         this.parent = parent;
@@ -53,7 +49,8 @@ public class SpawnedCrate {
         this.finishLocation = location;
         this.parent.getSpawnedCrates().add(this);
 
-        Scheduler.get().runAt(location, task -> {
+        // Using runLater() to schedule the tasks
+        Scheduler.get().runLater((task) -> {
             List<Entity> nearby = null;
 
             boolean chunkLoaded = location.getWorld().isChunkLoaded(location.getBlockX() >> 4, location.getBlockZ() >> 4);
@@ -67,45 +64,158 @@ public class SpawnedCrate {
                 return;
             }
 
+            // Delay the entity spawning to prevent performance hit
             Location spawnAt = location.clone();
             spawnAt.add(0.5, this.handle.getConfig().FALLING_BLOCK_HEIGHT, 0.5);
-            vex = location.getWorld().spawn(spawnAt, Vex.class, ent -> {
-                ent.setInvisible(true);
-                ent.setSilent(true);
-                ent.setInvulnerable(true);
-                ent.setGravity(true);
-                ent.setAware(false);
-                ent.setPersistent(false);
-                if (ent.getEquipment() != null) {
-                    ent.getEquipment().clear();
-                }
-            });
 
-            vex.setGravity(true);
+            // Use runLater() for delayed Vex spawn
+            Scheduler.get().runLater((delayedTask) -> {
+                vex = location.getWorld().spawn(spawnAt, Vex.class, ent -> {
+                    ent.setInvisible(true);
+                    ent.setSilent(true);
+                    ent.setInvulnerable(true);
+                    ent.setGravity(true);
+                    ent.setAware(false);
+                    ent.setPersistent(false);
+                    if (ent.getEquipment() != null) {
+                        ent.getEquipment().clear();
+                    }
+                });
 
-            fallingBlock = location.getWorld().spawnFallingBlock(spawnAt, Material.matchMaterial(this.handle.getConfig().FALLING_BLOCK_BLOCK.toUpperCase(Locale.ENGLISH)).createBlockData());
-            vex.addPassenger(fallingBlock);
-            fallingBlock.setPersistent(false);
-            fallingBlock.getPersistentDataContainer().set(FALLING_BLOCK_KEY, PersistentDataType.BYTE, (byte) 0);
-            FallingBlockChecker.addToCheck(this);
-            vex.setVelocity(new Vector(0, handle.getConfig().FALLING_BLOCK_SPEED, 0));
-        });
+                vex.setGravity(true);
+
+                // Delay falling block spawn
+                Scheduler.get().runLater((delayedTask2) -> {
+                    fallingBlock = location.getWorld().spawnFallingBlock(spawnAt, Material.matchMaterial(this.handle.getConfig().FALLING_BLOCK_BLOCK.toUpperCase(Locale.ENGLISH)).createBlockData());
+                    vex.addPassenger(fallingBlock);
+                    fallingBlock.setPersistent(false);
+                    fallingBlock.getPersistentDataContainer().set(FALLING_BLOCK_KEY, PersistentDataType.BYTE, (byte) 0);
+                    FallingBlockChecker.addToCheck(this);
+                    vex.setVelocity(new Vector(0, handle.getConfig().FALLING_BLOCK_SPEED, 0));
+                }, 10); // 10 ticks later
+            }, 5); // 5 ticks later
+        }, 1); // 1 tick later
     }
+
 
     public void land(@NotNull Location location) {
-        if (Config.DONT_REPLACE_BLOCKS) {
-            while (!location.getBlock().getType().equals(Material.AIR) && !location.getBlock().getType().equals(Material.VOID_AIR) && !location.getBlock().getType().equals(Material.CAVE_AIR)) {
-                if (location.getY() >= location.getWorld().getMaxHeight()) break;
-                location.add(0, 1, 0);
+        int radius = 1; // Start search radius
+        boolean validLocationFound = false;
+
+        while (!validLocationFound) {
+            for (int x = -radius; x <= radius; x++) {
+                for (int z = -radius; z <= radius; z++) {
+                    // Clone the location and offset by x and z
+                    Location candidateLocation = location.clone().add(x, 0, z);
+
+                    // Check vertically for the first valid solid block
+                    Location solidBlockLocation = findValidGround(candidateLocation);
+                    if (solidBlockLocation != null) {
+                        // A valid location was found
+                        validLocationFound = true;
+                        this.finishLocation = solidBlockLocation;
+
+                        // Place the envoy
+                        BlockIntegration.Companion.place(handle.getConfig().BLOCK_TYPE, solidBlockLocation);
+                        this.updateHologram();
+                        this.spawnFirework(solidBlockLocation);
+                        return;
+                    }
+                }
+            }
+
+            // Expand the search radius if no location is found
+            radius++;
+            if (radius > 5000) { // Safety limit to prevent infinite loop
+                System.out.println("No valid location found within 5000 blocks.");
+                return;
             }
         }
-        this.finishLocation = location;
-        BlockIntegration.Companion.place(handle.getConfig().BLOCK_TYPE, location);
-        this.updateHologram();
-        this.spawnFirework(location);
     }
 
-    private void updateHologram() {
+    /**
+     * Finds a valid ground block starting from the given location.
+     * Searches vertically downwards to avoid water-dominant issues.
+     *
+     * @param location The starting location
+     * @return The location of the valid ground block, or null if none is found.
+     */
+    private Location findValidGround(Location location) {
+        // Start from the current Y level and move down
+        World world = location.getWorld();
+        for (int y = location.getBlockY(); y >= world.getMinHeight(); y--) {
+            Location groundLocation = location.clone();
+            groundLocation.setY(y);
+
+            Block blockBelow = groundLocation.getBlock();
+            Material blockBelowType = blockBelow.getType();
+
+            // Check if the block is valid natural terrain
+            boolean isValidBlock = blockBelowType == Material.SAND
+                    || blockBelowType == Material.GRASS_BLOCK
+                    || blockBelowType == Material.STONE
+                    || blockBelowType == Material.COARSE_DIRT
+                    || blockBelowType == Material.ANDESITE
+                    || blockBelowType == Material.DIORITE
+                    || blockBelowType == Material.GRANITE
+                    || blockBelowType == Material.DRIPSTONE_BLOCK
+                    || blockBelowType == Material.MUD
+                    || blockBelowType == Material.DEEPSLATE
+                    || blockBelowType == Material.GRAVEL
+                    || blockBelowType == Material.DIRT
+                    || blockBelowType == Material.PODZOL
+                    || blockBelowType == Material.MYCELIUM
+                    || blockBelowType == Material.OAK_LEAVES
+                    || blockBelowType == Material.BIRCH_LEAVES
+                    || blockBelowType == Material.SPRUCE_LEAVES
+                    || blockBelowType == Material.JUNGLE_LEAVES
+                    || blockBelowType == Material.DARK_OAK_LEAVES
+                    || blockBelowType == Material.ACACIA_LEAVES
+                    || blockBelowType == Material.CHERRY_LEAVES
+                    || blockBelowType == Material.PALE_OAK_LEAVES;
+
+            boolean isInvalidBlock = blockBelowType == Material.WATER
+                    || blockBelowType == Material.KELP
+                    || blockBelowType == Material.SEAGRASS
+                    || blockBelowType == Material.BUBBLE_COLUMN;
+
+            // Ensure the block is solid and not invalid
+            if (isValidBlock && !isInvalidBlock) {
+                // Ensure the block isn't surrounded by water
+                if (isSurroundedByWater(groundLocation)) continue;
+                return groundLocation.add(0, 1, 0); // Return the location above the ground
+            }
+        }
+        return null; // No valid ground found
+    }
+
+    /**
+     * Checks if the block is surrounded by water.
+     *
+     * @param location The location of the block
+     * @return true if surrounded by water, false otherwise
+     */
+    private boolean isSurroundedByWater(Location location) {
+        World world = location.getWorld();
+        for (int x = -1; x <= 1; x++) {
+            for (int z = -1; z <= 1; z++) {
+                // Skip the center block
+                if (x == 0 && z == 0) continue;
+
+                Location adjacentLocation = location.clone().add(x, 0, z);
+                Material adjacentType = world.getBlockAt(adjacentLocation).getType();
+
+                if (adjacentType != Material.WATER) {
+                    return false; // Not surrounded by water
+                }
+            }
+        }
+        return true; // Fully surrounded by water
+    }
+
+
+
+                private void updateHologram() {
         if (!handle.getConfig().HOLOGRAM_ENABLED) return;
         if (hologram == null) {
             Location hologramLocation = finishLocation.clone().add(0.5, 0, 0.5);
@@ -128,7 +238,7 @@ public class SpawnedCrate {
         Scheduler.get().executeAt(location, () -> {
             Location loc2 = location.clone();
             loc2.add(0.5, 0.5, 0.5);
-            Firework fw = (Firework) location.getWorld().spawnEntity(loc2, EntityType.FIREWORK);
+            Firework fw = (Firework) location.getWorld().spawnEntity(loc2, EntityType.FIREWORK_ROCKET);
             FireworkMeta meta = fw.getFireworkMeta();
             meta.addEffect(FireworkEffect.builder().with(this.handle.getFireworkType()).withColor(org.bukkit.Color.fromRGB(this.handle.getFireworkColor().getRed(), this.handle.getFireworkColor().getGreen(), this.handle.getFireworkColor().getBlue())).build());
             meta.setPower(0);
@@ -137,7 +247,10 @@ public class SpawnedCrate {
             fw.detonate();
         });
     }
-
+    private boolean isWater(Location location) {
+        Material blockType = location.getBlock().getType();
+        return blockType == Material.WATER || blockType == Material.KELP || blockType == Material.SEAGRASS || blockType == Material.BUBBLE_COLUMN;
+    }
     public void damage(User user, Envoy envoy) {
         if (user.canCollect(envoy, this.getHandle())) {
             health--;
@@ -234,7 +347,7 @@ public class SpawnedCrate {
                     return;
                 Location loc2 = finishLocation.clone();
                 loc2.add(0.5, 0.5, 0.5);
-                Firework fw = (Firework) loc2.getWorld().spawnEntity(loc2, EntityType.FIREWORK);
+                Firework fw = (Firework) loc2.getWorld().spawnEntity(loc2, EntityType.FIREWORK_ROCKET);
                 FireworkMeta meta = fw.getFireworkMeta();
                 meta.addEffect(FireworkEffect.builder().with(this.handle.getFlareFireworkType()).withColor(org.bukkit.Color.fromRGB(this.handle.getFlareFireworkColor().getRed(), this.handle.getFlareFireworkColor().getGreen(), this.handle.getFlareFireworkColor().getBlue())).build());
                 meta.setPower(0);
